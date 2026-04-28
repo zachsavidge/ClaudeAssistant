@@ -2,27 +2,38 @@
 """
 convert_xls.py - Cross-platform .xls → .xlsx batch converter.
 
-Strategy:
-  1. PRIMARY: pure-Python via xlrd + openpyxl (works on Mac, Linux, Windows)
-     - Loses formulas/charts but preserves all values + text
-     - Fast and reliable for survey/research data
-  2. FALLBACK: Excel COM via pywin32 (Windows only, if installed)
-     - Preserves formulas, formatting, charts
+Strategy (tiered, formula-preservation aware):
+  1. PRIMARY: LibreOffice headless (`soffice --headless --convert-to xlsx`)
+     - Cross-platform: Linux cloud sandboxes (apt install libreoffice-calc),
+       macOS (brew install --cask libreoffice), Windows (rare but works)
+     - Preserves formulas, charts, formatting (verified on SUM/AVERAGE/mixed
+       arithmetic; Excel data_type='f' round-trips correctly)
+     - Auto-selected when `soffice` (or `libreoffice`) is on PATH
+     - ~3s/file on warm sandbox; ~100MB install, one-time
+     - Cannot handle password-protected files via CLI (decrypt first)
+  2. FALLBACK A: Excel COM via pywin32 (Windows only, opt-in via --use-excel)
+     - Preserves formulas, formatting, charts (truest fidelity to Excel)
      - Can hang on certain files (especially Drive Streaming paths)
-     - Only attempted with --use-excel flag (opt-in)
+     - Handles password-protected files inline
+  3. FALLBACK B: pure-Python via xlrd + openpyxl (last resort, cross-platform)
+     - Loses formulas/charts but preserves all values + text
+     - Fast; reliable for survey/research data without live calculations
 
-Both tiers handle password-protected .xls via the optional --password flag.
+Tiers 1 and 2 handle password-protected .xls via the optional --password flag.
 
 Usage:
   python convert_xls.py <folder>                      # walk folder, convert all .xls
   python convert_xls.py <folder> --password RENGA2025 # try this password if encrypted
-  python convert_xls.py <folder> --use-excel          # try Excel COM first (Windows only)
+  python convert_xls.py <folder> --use-excel          # prefer Excel COM (Windows + Excel)
+  python convert_xls.py <folder> --no-libreoffice     # skip LibreOffice (force-fallback)
   python convert_xls.py <file.xls>                    # convert single file
 
 Outputs the .xlsx alongside the .xls and removes the original on success.
 """
 
 import os
+import shutil
+import subprocess
 import sys
 import time
 import argparse
@@ -91,6 +102,49 @@ def convert_pure_python(xls_path, password=None):
     return True, f"OK ({len(rb.sheet_names())} sheets)"
 
 
+def _find_soffice():
+    """Locate the LibreOffice binary on PATH. Returns path or None."""
+    return shutil.which("soffice") or shutil.which("libreoffice")
+
+
+def convert_libreoffice(xls_path, password=None, timeout=120):
+    """Convert via LibreOffice headless. Cross-platform, preserves formulas/charts.
+
+    Verified in Anthropic cloud sandboxes (Debian + libreoffice-calc): SUM,
+    AVERAGE, and mixed-arithmetic formulas round-trip with openpyxl
+    data_type='f'. macOS works after `brew install --cask libreoffice`.
+    """
+    soffice = _find_soffice()
+    if not soffice:
+        return False, "soffice not on PATH (install libreoffice-calc / libreoffice)"
+
+    if password:
+        # LibreOffice CLI doesn't accept passwords directly. Decrypt first via
+        # decrypt_excel.py (msoffcrypto-tool) and re-run on the cleartext copy.
+        return False, "LibreOffice CLI cannot accept password — decrypt with decrypt_excel.py first"
+
+    out_dir = os.path.dirname(os.path.abspath(xls_path))
+    cmd = [soffice, "--headless", "--convert-to", "xlsx", "--outdir", out_dir, xls_path]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"LibreOffice timed out (>{timeout}s)"
+    except Exception as e:
+        return False, f"LibreOffice exec: {e}"
+
+    expected = os.path.join(
+        out_dir, os.path.splitext(os.path.basename(xls_path))[0] + ".xlsx"
+    )
+    if result.returncode == 0 and os.path.exists(expected):
+        return True, "OK (via LibreOffice)"
+
+    err = (result.stderr or result.stdout or "").strip().replace("\n", " | ")[:200]
+    return False, f"LibreOffice rc={result.returncode}: {err}"
+
+
 def convert_excel_com(xls_path, password=None, timeout=30):
     """Convert via Excel COM (Windows only). Returns (success, message)."""
     if sys.platform != "win32":
@@ -140,16 +194,28 @@ def convert_excel_com(xls_path, password=None, timeout=30):
         return False, f"Excel COM: {e}"
 
 
-def convert_one(xls_path, password=None, use_excel=False):
-    """Convert a single file. Tries Excel COM first (if requested) then pure Python."""
+def convert_one(xls_path, password=None, use_excel=False, no_libreoffice=False):
+    """Convert a single file. Tier order:
+
+    1. Excel COM (Windows + --use-excel only) — truest fidelity, opt-in
+    2. LibreOffice headless (auto-detect) — formula-preserving, cross-platform
+    3. Pure Python (xlrd + openpyxl) — fallback, lossy on formulas
+    """
     # Tier 1: Excel COM (only if explicitly requested AND Windows)
     if use_excel and sys.platform == "win32":
         ok, msg = convert_excel_com(xls_path, password)
         if ok:
             return ok, msg
-        # Fall through to pure Python
+        # Fall through
 
-    # Tier 2 (default): pure Python
+    # Tier 2: LibreOffice (skipped only if explicitly disabled)
+    if not no_libreoffice and _find_soffice():
+        ok, msg = convert_libreoffice(xls_path, password)
+        if ok:
+            return ok, msg
+        # Fall through (e.g. password-protected, soffice crashed)
+
+    # Tier 3: pure Python (lossy but always available)
     return convert_pure_python(xls_path, password)
 
 
@@ -170,7 +236,9 @@ def main():
     p.add_argument("target", help="Folder or single .xls file")
     p.add_argument("--password", help="Password to try if files are encrypted")
     p.add_argument("--use-excel", action="store_true",
-                   help="Try Excel COM first (Windows only); fall back to pure Python on failure")
+                   help="Try Excel COM first (Windows only); fall back to LibreOffice/pure Python on failure")
+    p.add_argument("--no-libreoffice", action="store_true",
+                   help="Skip LibreOffice tier even if soffice is on PATH (forces pure-Python fallback)")
     p.add_argument("--keep-original", action="store_true",
                    help="Don't delete the .xls after successful conversion")
     args = p.parse_args()
@@ -180,8 +248,16 @@ def main():
         print(f"No .xls files found in {args.target}")
         return
 
+    soffice = _find_soffice()
+    tiers = []
+    if args.use_excel and sys.platform == "win32":
+        tiers.append("Excel COM")
+    if soffice and not args.no_libreoffice:
+        tiers.append(f"LibreOffice ({soffice})")
+    tiers.append("pure Python")
+
     print(f"Found {len(files)} .xls file(s). Platform: {sys.platform}")
-    print(f"Strategy: {'Excel COM → pure Python' if args.use_excel and sys.platform == 'win32' else 'pure Python only'}")
+    print(f"Strategy: {' → '.join(tiers)}")
     print()
 
     ok_count = 0
@@ -190,7 +266,12 @@ def main():
         rel = os.path.relpath(path)
         print(f"[{i}/{len(files)}] {rel}", flush=True)
         t0 = time.time()
-        success, msg = convert_one(path, password=args.password, use_excel=args.use_excel)
+        success, msg = convert_one(
+            path,
+            password=args.password,
+            use_excel=args.use_excel,
+            no_libreoffice=args.no_libreoffice,
+        )
         elapsed = time.time() - t0
         if success:
             if not args.keep_original:
