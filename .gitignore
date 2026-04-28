@@ -1,0 +1,17 @@
+# Local Claude Code settings (per-machine, may contain local paths/preferences)
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Node
+node_modules/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
