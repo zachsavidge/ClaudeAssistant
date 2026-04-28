@@ -1,30 +1,47 @@
 """
-_cloud_creds.py — bootstrap GCP credentials from a JSON-string env var.
+_cloud_creds.py — bootstrap GCP credentials and TLS settings for cloud sandboxes.
 
-Cloud sandboxes (claude.ai/code, claude.ai chat) can only set string env vars,
-not upload files. The Google client libraries, however, expect
-GOOGLE_APPLICATION_CREDENTIALS to be a *file path*. This module bridges that gap:
+Two responsibilities, both no-ops on local Windows/macOS where things just work:
 
-    if GOOGLE_APPLICATION_CREDENTIALS_JSON is set and GOOGLE_APPLICATION_CREDENTIALS
-    is not, write the JSON to a secure temp file and point
-    GOOGLE_APPLICATION_CREDENTIALS at that file.
+1. **Credential materialization.** Cloud sandboxes (claude.ai/code) can only set
+   string env vars, but the Google client libraries expect
+   `GOOGLE_APPLICATION_CREDENTIALS` to be a *file path*. If
+   `GOOGLE_APPLICATION_CREDENTIALS_JSON` is set and
+   `GOOGLE_APPLICATION_CREDENTIALS` isn't, write the JSON to a secure temp file
+   and point the standard env var at it.
 
-Import this module at the top of any script that needs GCP auth, BEFORE any
-`from google...` imports. It runs the bootstrap on import and is a no-op on
-machines where GOOGLE_APPLICATION_CREDENTIALS already points at a real file
-(i.e., your local Windows / macOS setup is unaffected).
+2. **TLS trust on intercepting Linux sandboxes.** Claude Code on the Web routes
+   outbound HTTPS through a TLS-inspecting proxy whose CA
+   (`O=Anthropic, CN=sandbox-egress-production TLS Inspection CA`) is installed
+   into the system bundle (`/etc/ssl/certs/ca-certificates.crt`) but NOT into
+   certifi's bundled `cacert.pem`. So:
+   - **gRPC** ignores `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` and needs its own
+     env var: `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`. Required for the GCP
+     Translation API client.
+   - **httplib2** (the default transport for `googleapiclient`, used for the
+     Drive API) reads its `CA_CERTS` class attribute, which defaults to
+     `certifi.where()`. We patch it on import.
 
-Usage:
-    import _cloud_creds  # noqa: F401  -- bootstraps GCP creds for cloud sandbox
+   Both patches only fire on Linux when the system bundle exists, so local dev
+   on Windows / macOS is untouched.
+
+Import this at the top of any script that uses GCP libraries, BEFORE any
+`from google...` or `import googleapiclient` imports:
+
+    import _cloud_creds  # noqa: F401  -- bootstraps GCP creds + TLS for cloud
 """
 
 import json
 import os
 import stat
+import sys
 import tempfile
 
+SYSTEM_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
-def _bootstrap() -> None:
+
+def _bootstrap_gcp_creds() -> None:
+    """Materialize GOOGLE_APPLICATION_CREDENTIALS_JSON to a file path."""
     existing = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if existing and os.path.exists(existing):
         # Local setup — file path is real, do nothing.
@@ -46,7 +63,6 @@ def _bootstrap() -> None:
             "the value of this env var."
         ) from e
 
-    # Write to a tempfile that survives for the lifetime of the process.
     fd, path = tempfile.mkstemp(prefix="gcp-sa-", suffix=".json")
     try:
         with os.fdopen(fd, "w") as f:
@@ -57,7 +73,6 @@ def _bootstrap() -> None:
         except OSError:
             pass
     except Exception:
-        # Clean up if we failed mid-write.
         try:
             os.unlink(path)
         except OSError:
@@ -67,4 +82,32 @@ def _bootstrap() -> None:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
 
 
-_bootstrap()
+def _bootstrap_tls() -> None:
+    """Make gRPC and httplib2 trust the system CA bundle on Linux.
+
+    Linux-only because that's where TLS-intercepting cloud sandboxes run; on
+    Windows/macOS local dev, the system trust stores already cover everything.
+    """
+    if sys.platform != "linux":
+        return
+    if not os.path.exists(SYSTEM_CA_BUNDLE):
+        return
+
+    # gRPC's C-Core ignores SSL_CERT_FILE / REQUESTS_CA_BUNDLE; it reads only
+    # this var. setdefault so an explicit user override still wins.
+    os.environ.setdefault("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", SYSTEM_CA_BUNDLE)
+
+    # googleapiclient defaults to httplib2, which reads CA_CERTS at request
+    # time. Patch the class attribute if the lib is importable; no-op
+    # otherwise. Done at module load so any later `from googleapiclient...`
+    # gets the patched version.
+    try:
+        import httplib2  # type: ignore[import-untyped]
+
+        httplib2.CA_CERTS = SYSTEM_CA_BUNDLE
+    except ImportError:
+        pass
+
+
+_bootstrap_gcp_creds()
+_bootstrap_tls()
