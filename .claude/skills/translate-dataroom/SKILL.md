@@ -81,9 +81,16 @@ destination parent folder for `up` to work.
 **Pip install in cloud sandbox** — at the start of a cloud session, run:
 
 ```
-pip install google-cloud-translate google-api-python-client google-auth google-auth-oauthlib \
+pip install --upgrade --ignore-installed cryptography cffi \
+            google-cloud-translate google-api-python-client google-auth google-auth-oauthlib \
             PyPDF2 xlrd openpyxl msoffcrypto-tool openai pydub imageio-ffmpeg
 ```
+
+The `--ignore-installed cryptography cffi` prefix is required because Anthropic's
+cloud sandboxes (Debian-based) ship a system-package `cryptography 41.0.7` whose
+`RECORD` file conflicts with pip's metadata. Without these flags, `pip install`
+fails with `_cffi_backend not found` mid-install. The flags force pip to install
+fresh copies into the user site without trying to remove the system version.
 
 Skip `pywin32` — it is Windows-only and the pure-Python paths cover everything
 needed in a Linux sandbox.
