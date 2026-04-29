@@ -1,6 +1,9 @@
 # Local Claude Code settings (per-machine, may contain local paths/preferences)
 .claude/settings.local.json
 
+# Skill secrets
+.claude/skills/**/.secrets.json
+
 # Python
 __pycache__/
 *.pyc
