@@ -202,6 +202,13 @@ able to point to the exact document and location immediately.
 Create the findings as a **sub-page of the master Notion page** the user provides. Use the
 Notion MCP tools to create the sub-page under the master page.
 
+If no Notion MCP tools are available, fall back to direct Notion REST API calls
+(`https://api.notion.com/v1/...`, version `2022-06-28`). The internal-integration token is stored
+at `.claude/skills/dd-analyzer/.secrets.json` (key: `notion_api_token`); load it from there. The
+master page ID is the 32-char hex string at the end of the page URL (strip dashes if present).
+The integration must already be invited to the master page (Add connections menu in Notion). If
+the token is missing, ask the user for one and save it to that file.
+
 **Page title:** `[Company Name] — Diligence Findings`
 
 **Sections** (one per category from the question list):
